@@ -132,7 +132,7 @@ async function poll() {
       if (last.phien !== lastPhien) {
         if (predMeta) {
           const nx = history.find((r) => r.n > predMeta.afterN);
-          if (nx) { live.tong++; if (nx.kq === predMeta.side) live.dung++; }
+          if (nx) { live.tong++; if (nx.kq === predMeta.side) live.dung++; learn(nx); }
         }
         lastPhien = last.phien;
         lastPrediction = buildPrediction();
@@ -211,6 +211,7 @@ const live = { dung: 0, tong: 0 };
 let modelStats = [];
 let predMeta = null;
 let runMeta = null;
+let hedge = null; // trọng số tự học theo kết quả thật, mỗi thuật toán một số
 
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const logit = (p) => { p = clamp(p, 0.02, 0.98); return Math.log(p / (1 - p)); };
@@ -362,6 +363,17 @@ const safe = (fn, S, h, n) => {
   try { const p = fn(S, h, n); return typeof p === 'number' && isFinite(p) ? p : null; } catch (e) { return null; }
 };
 
+// Tự học: sau mỗi phiên có kết quả thật, thuật toán nào bỏ phiếu sai thì giảm trọng số, đúng thì tăng nhẹ
+function learn(nx) {
+  if (!predMeta || !predMeta.votes || !hedge) return;
+  const isT = nx.kq === 'T';
+  predMeta.votes.forEach((p, i) => {
+    if (p === null || Math.abs(p - 0.5) < 0.005 || hedge[i] === undefined) return;
+    const wrong = (p >= 0.5) !== isT;
+    hedge[i] = clamp(hedge[i] * Math.exp(wrong ? -0.1 : 0.1), 0.3, 2.5);
+  });
+}
+
 function buildPrediction() {
   if (!history.length) return null;
   const h = history.slice(-MAX_USE);
@@ -373,7 +385,9 @@ function buildPrediction() {
   // chấm điểm từng thuật toán bằng backtest, rồi lấy phiếu hiện tại
   const stats = [];
   runMeta = null;
-  for (const [name, fn] of MODELS) {
+  if (!hedge || hedge.length !== MODELS.length) hedge = MODELS.map(() => 1);
+  for (let mi = 0; mi < MODELS.length; mi++) {
+    const [name, fn] = MODELS[mi];
     let ok = 0, cnt = 0;
     for (let i = start; i < n; i++) {
       const p = safe(fn, S, h, i);
@@ -383,7 +397,7 @@ function buildPrediction() {
     }
     const acc = cnt ? ok / cnt : 0.5;
     const shrunk = (ok + 25) / (cnt + 50); // kéo về 50% khi ít mẫu để tránh may mắn ngẫu nhiên
-    const w = 0.03 + Math.max(0, shrunk - 0.53) * 6;
+    const w = (0.03 + Math.max(0, shrunk - 0.53) * 6) * hedge[mi];
     stats.push({ name, acc, cnt, w, p: safe(fn, S, h, n) });
   }
   const used = stats.filter((s) => s.p !== null);
@@ -424,14 +438,15 @@ function buildPrediction() {
   }
   reason += `. Chọn ${how}.`;
 
-  modelStats = stats.map((s) => ({
+  modelStats = stats.map((s, i) => ({
     Thuat_toan: s.name,
     Phieu: s.p === null ? 'chưa đủ dữ liệu' : (s.p >= 0.5 ? 'Tài' : 'Xỉu'),
     Ti_le_backtest: s.cnt ? Math.round(s.acc * 100) + '%' : 'n/a',
     So_mau: s.cnt,
     Trong_so: Number(s.w.toFixed(3)),
+    He_so_tu_hoc: Number(hedge[i].toFixed(2)),
   }));
-  predMeta = { afterN: last.n, side };
+  predMeta = { afterN: last.n, side, votes: stats.map((s) => s.p) };
 
   return {
     Id: ID_NAME,
@@ -470,7 +485,6 @@ const server = http.createServer((req, res) => {
   }
   return send(res, 404, { loi: 'Not found' });
 });
-
 
 loadFile();
 if (history.length) lastPrediction = buildPrediction();
