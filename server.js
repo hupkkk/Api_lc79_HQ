@@ -130,6 +130,10 @@ async function poll() {
     if (history.length) {
       const last = history[history.length - 1];
       if (last.phien !== lastPhien) {
+        if (predMeta) {
+          const nx = history.find((r) => r.n > predMeta.afterN);
+          if (nx) { live.tong++; if (nx.kq === predMeta.side) live.dung++; }
+        }
         lastPhien = last.phien;
         lastPrediction = buildPrediction();
       }
@@ -190,39 +194,54 @@ function buildCauData() {
     Tong_phien: history.length,
     Tong_bang: tables.length,
     Cau_hien_tai: runs.length ? describeRuns(runs) : null,
+    Thong_ke: {
+      Du_doan_dung: live.dung,
+      Du_doan_tong: live.tong,
+      Ti_le_thuc_te: live.tong ? Math.round((live.dung / live.tong) * 100) + '%' : 'chưa có',
+      Thuat_toan: modelStats,
+    },
     Bang_cau: tables,
   };
 }
 
-/* ===================== THUẬT TOÁN DỰ ĐOÁN ===================== */
-/**
- * Dựa trên dãy cầu (cùng dữ liệu của /dulieucau), với cầu đang chạy (độ dài run hiện tại L)
- * và ngữ cảnh k run trước đó (vd 2-1-2, 1-1, 2-2...), tìm trong lịch sử các lần cầu y hệt:
- * cầu đó đã đi tiếp (theo) hay đã dừng đúng chỗ (bẻ). Từ đó ra xác suất theo/bẻ.
- */
-function buildPrediction() {
-  if (!history.length) return null;
-  const last = history[history.length - 1];
-  const seq = history.map((r) => r.kq);
-  const runs = runsOf(seq);
-  const n = runs.length;
-  const cur = runs[n - 1];
+/* ===================== THUẬT TOÁN DỰ ĐOÁN (NHIỀU MÔ HÌNH BỎ PHIẾU) ===================== */
+const MAX_USE = 600;   // chỉ dùng 600 phiên gần nhất để tính cho nhẹ
+const BT_WINDOW = 100; // số phiên gần nhất dùng để chấm điểm từng thuật toán
+const live = { dung: 0, tong: 0 };
+let modelStats = [];
+let predMeta = null;
+let runMeta = null;
+
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const logit = (p) => { p = clamp(p, 0.02, 0.98); return Math.log(p / (1 - p)); };
+const sigm = (z) => 1 / (1 + Math.exp(-z));
+const smooth = (hit, tot, k) => {
+  const p = (hit + 1) / (tot + 2);
+  const w = tot / (tot + k);
+  return 0.5 * (1 - w) + p * w;
+};
+const pointBucket = (p) => (p <= 7 ? 0 : p <= 10 ? 1 : p <= 13 ? 2 : p <= 16 ? 3 : 4);
+
+// Mỗi mô hình: (S, h, n) -> xác suất phiên thứ n ra Tài, chỉ dùng dữ liệu trước n. null = chưa đủ dữ liệu.
+// S là chuỗi 'T'/'X', h là mảng bản ghi (có .sum, .dices)
+
+// 1) Cầu theo/bẻ: thế cầu y hệt trong lịch sử đã đi tiếp hay đã dừng, có điểm dừng cho bệt
+function mRun(S, h, n) {
+  const runs = runsOf(S.slice(0, n));
+  const m = runs.length;
+  if (m < 3) return null;
+  const cur = runs[m - 1];
   const L = cur.len;
-
-  let num = 0;
-  let den = 0;
-  let best = null;
-
+  let num = 0, den = 0, best = null;
   for (let k = 0; k <= 4; k++) {
-    if (n - 1 - k < 0) break;
-    const ctx = runs.slice(n - 1 - k, n - 1).map((r) => r.len).join('-');
-    let cont = 0;
-    let brk = 0;
-    for (let j = k; j <= n - 2; j++) {
+    if (m - 1 - k < 0) break;
+    const ctx = runs.slice(m - 1 - k, m - 1).map((r) => r.len).join('-');
+    let cont = 0, brk = 0;
+    for (let j = k; j <= m - 2; j++) {
       if (runs[j].len < L) continue;
       const c = runs.slice(j - k, j).map((r) => r.len).join('-');
       if (c !== ctx) continue;
-      const w = 1 + j / n; // phiên gần đây có trọng số cao hơn
+      const w = 1 + j / m;
       if (runs[j].len > L) cont += w; else brk += w;
     }
     const tot = cont + brk;
@@ -233,51 +252,193 @@ function buildPrediction() {
     den += weight;
     if (!best || weight > best.weight) best = { k, ctx, cont, brk, tot, weight };
   }
+  let pc = den > 0 ? (num + 0.15) / (den + 0.3) : 0.5;
+  if (L >= 4) pc -= Math.min(0.25, (L - 3) * 0.04); // điểm dừng của bệt
+  pc = clamp(pc, 0.2, 0.8);
+  runMeta = { best, L, cur, runs };
+  return cur.v === 'T' ? pc : 1 - pc;
+}
 
-  let pc = den > 0 ? (num + 0.5 * 0.3) / (den + 0.3) : 0.5; // xác suất cầu đi tiếp (theo)
-  const notes = [];
-
-  // Điểm dừng cho cầu bệt: bệt từ 4 trở đi thì càng dài càng phải cân nhắc bẻ
-  if (L >= 4) {
-    const pen = Math.min(0.25, (L - 3) * 0.04);
-    pc -= pen;
-    notes.push(`bệt ${L} phiên ${nameOf(cur.v)}, đã vào vùng cân nhắc điểm dừng`);
+// 2) Markov bậc k
+const mMarkov = (k) => (S, h, n) => {
+  if (n < k + 15) return null;
+  const cur = S.substr(n - k, k);
+  let hit = 0, tot = 0;
+  for (let j = k; j < n; j++) {
+    if (S.substr(j - k, k) === cur) { tot++; if (S[j] === 'T') hit++; }
   }
+  return tot < 3 ? null : smooth(hit, tot, 4);
+};
 
-  // Tính thầm điểm xúc xắc phiên vừa ra
-  const s = last.sum;
-  const triple = last.dices[0] === last.dices[1] && last.dices[1] === last.dices[2];
-  if (triple) { pc -= 0.04; notes.push(`bộ ba ${last.dices.join('-')} có tín hiệu bẻ`); }
-  else if (s <= 5 || s >= 16) { pc -= 0.03; notes.push(`điểm cực đoan ${s}, nghiêng về bẻ nhẹ`); }
-  else if (s === 10 || s === 11) { pc += 0.02; notes.push(`điểm sát ngưỡng ${s}, nghiêng về theo nhẹ`); }
-
-  pc = Math.max(0.2, Math.min(0.8, pc));
-
-  const follow = pc >= 0.5;
-  const predSide = follow ? cur.v : (cur.v === 'T' ? 'X' : 'T');
-  const strength = Math.abs(pc - 0.5);
-  const how = follow ? (strength > 0.15 ? 'theo mạnh' : 'theo nhẹ') : (strength > 0.15 ? 'bẻ mạnh' : 'bẻ nhẹ');
-
-  let confidence = Math.round(50 + strength * 100);
-  confidence = Math.max(51, Math.min(60, confidence)); // kết quả xúc xắc là ngẫu nhiên nên không để độ tin cậy ảo cao
-  if (history.length < TABLE_SIZE) confidence = Math.min(confidence, 55);
-
-  const dang = describeRuns(runs);
-  let reason = `Dựa vào /dulieucau: cầu đang chạy dạng ${dang}, hiện ${L} phiên ${nameOf(cur.v)} liên tiếp`;
-  if (best) {
-    reason += `; cầu này trong lịch sử đã đi tiếp ${Math.round(best.cont)} lần, dừng ${Math.round(best.brk)} lần`;
-  } else {
-    reason += '; chưa đủ mẫu cầu tương tự';
+// 3) N-gram đa bậc (2..8), bậc cao ưu tiên khi đủ mẫu
+function mNgram(S, h, n) {
+  if (n < 30) return null;
+  let p = 0.5, used = false;
+  for (let k = 2; k <= 8; k++) {
+    const cur = S.substr(n - k, k);
+    let hit = 0, tot = 0;
+    for (let j = k; j < n; j++) {
+      if (S.substr(j - k, k) === cur) { tot++; if (S[j] === 'T') hit++; }
+    }
+    if (tot > 0) {
+      const pk = (hit + 1) / (tot + 2);
+      const w = tot / (tot + 5);
+      p = w * pk + (1 - w) * p;
+      used = true;
+    }
   }
-  if (notes.length) reason += '; ' + notes.join('; ');
+  return used ? p : null;
+}
+
+// 4) Cầu đan xen 1-1: chuỗi đan xen dài a thì lịch sử cho thấy tiếp tục đan xen hay gãy
+function mZigzag(S, h, n) {
+  if (n < 20) return null;
+  let a = 1;
+  const cnt = {};
+  for (let j = 1; j < n; j++) {
+    const key = Math.min(a, 8);
+    const c = cnt[key] || (cnt[key] = [0, 0]);
+    c[1]++;
+    if (S[j] !== S[j - 1]) c[0]++;
+    a = S[j] !== S[j - 1] ? a + 1 : 1;
+  }
+  if (a < 3) return null;
+  const c = cnt[Math.min(a, 8)];
+  if (!c || c[1] < 3) return null;
+  const pAlt = smooth(c[0], c[1], 4);
+  return S[n - 1] === 'T' ? 1 - pAlt : pAlt;
+}
+
+// 5) Cầu chu kỳ (lặp lại theo chu kỳ 2..6)
+function mPeriod(S, h, n) {
+  for (let p = 2; p <= 6; p++) {
+    if (n < p * 3 + 10) continue;
+    let ok = true;
+    for (let i = n - 1; i >= n - 2 * p; i--) {
+      if (S[i] !== S[i - p]) { ok = false; break; }
+    }
+    if (ok) return S[n - p] === 'T' ? 0.62 : 0.38;
+  }
+  return null;
+}
+
+// 6) Cân bằng Tài/Xỉu trong 30 phiên gần nhất (hồi quy về trung bình, rất nhẹ)
+function mFreq(S, h, n) {
+  if (n < 30) return null;
+  let t = 0;
+  for (let i = n - 30; i < n; i++) if (S[i] === 'T') t++;
+  return clamp(0.5 - (t / 30 - 0.5) * 0.5, 0.35, 0.65);
+}
+
+// 7) Các mô hình theo đặc trưng của điểm xúc xắc
+const mKeyed = (keyFn, d, minTot) => (S, h, n) => {
+  if (n < 20) return null;
+  const key = (j) => { let s = ''; for (let i = j - d; i < j; i++) s += keyFn(h[i]) + ','; return s; };
+  const cur = key(n);
+  let hit = 0, tot = 0;
+  for (let j = d; j < n; j++) {
+    if (key(j) === cur) { tot++; if (S[j] === 'T') hit++; }
+  }
+  return tot < minTot ? null : smooth(hit, tot, 8);
+};
+
+const MODELS = [
+  ['Cầu theo/bẻ + điểm dừng bệt', mRun],
+  ['Markov bậc 2', mMarkov(2)],
+  ['Markov bậc 3', mMarkov(3)],
+  ['Markov bậc 4', mMarkov(4)],
+  ['Markov bậc 5', mMarkov(5)],
+  ['N-gram đa bậc', mNgram],
+  ['Cầu đan xen 1-1', mZigzag],
+  ['Cầu chu kỳ', mPeriod],
+  ['Cân bằng Tài/Xỉu 30 phiên', mFreq],
+  ['Điểm xúc xắc phiên trước', mKeyed((r) => pointBucket(r.sum), 1, 5)],
+  ['Chuỗi điểm 2 phiên', mKeyed((r) => pointBucket(r.sum), 2, 5)],
+  ['Chẵn/lẻ tổng điểm', mKeyed((r) => r.sum % 2, 3, 5)],
+  ['Bộ ba / điểm cực đoan', mKeyed((r) => (r.dices[0] === r.dices[1] && r.dices[1] === r.dices[2] ? 'B' : r.sum <= 5 ? 'L' : r.sum >= 16 ? 'H' : 'N'), 1, 5)],
+];
+
+const safe = (fn, S, h, n) => {
+  try { const p = fn(S, h, n); return typeof p === 'number' && isFinite(p) ? p : null; } catch (e) { return null; }
+};
+
+function buildPrediction() {
+  if (!history.length) return null;
+  const h = history.slice(-MAX_USE);
+  const n = h.length;
+  const S = h.map((r) => r.kq).join('');
+  const last = h[n - 1];
+  const start = Math.max(30, n - BT_WINDOW);
+
+  // chấm điểm từng thuật toán bằng backtest, rồi lấy phiếu hiện tại
+  const stats = [];
+  runMeta = null;
+  for (const [name, fn] of MODELS) {
+    let ok = 0, cnt = 0;
+    for (let i = start; i < n; i++) {
+      const p = safe(fn, S, h, i);
+      if (p === null || Math.abs(p - 0.5) < 0.005) continue;
+      cnt++;
+      if ((p >= 0.5) === (S[i] === 'T')) ok++;
+    }
+    const acc = cnt ? ok / cnt : 0.5;
+    const shrunk = (ok + 25) / (cnt + 50); // kéo về 50% khi ít mẫu để tránh may mắn ngẫu nhiên
+    const w = 0.03 + Math.max(0, shrunk - 0.53) * 6;
+    stats.push({ name, acc, cnt, w, p: safe(fn, S, h, n) });
+  }
+  const used = stats.filter((s) => s.p !== null);
+
+  let pT = 0.5;
+  if (used.length) {
+    let z = 0, ws = 0;
+    for (const s of used) { z += s.w * logit(s.p); ws += s.w; }
+    pT = sigm(z / ws);
+  }
+  pT = clamp(pT, 0.38, 0.62);
+
+  const runs = runsOf(S);
+  const cur = runs[runs.length - 1];
+  const L = cur.len;
+  const side = pT >= 0.5 ? 'T' : 'X';
+  const follow = side === cur.v;
+  const strength = Math.abs(pT - 0.5);
+  const how = (follow ? 'theo' : 'bẻ') + (strength > 0.08 ? ' mạnh' : ' nhẹ');
+
+  let confidence = Math.round(Math.max(pT, 1 - pT) * 100);
+  confidence = clamp(confidence, 51, 62); // xúc xắc là ngẫu nhiên nên không để độ tin cậy ảo cao
+  if (n < TABLE_SIZE) confidence = Math.min(confidence, 55);
+
+  const top = used
+    .slice()
+    .sort((a, b) => Math.abs(b.w * logit(b.p)) - Math.abs(a.w * logit(a.p)))
+    .slice(0, 3);
+
+  let reason = `Dựa vào /dulieucau: cầu đang chạy dạng ${describeRuns(runs)}, hiện ${L} phiên ${nameOf(cur.v)} liên tiếp`;
+  if (L >= 4) reason += `, bệt ${L} đã vào vùng cân nhắc điểm dừng`;
+  if (runMeta && runMeta.best) {
+    reason += `; cầu này trong lịch sử đã đi tiếp ${Math.round(runMeta.best.cont)} lần, dừng ${Math.round(runMeta.best.brk)} lần`;
+  }
+  if (top.length) {
+    reason += `; ${used.length} thuật toán bỏ phiếu, nổi bật: ` +
+      top.map((t) => `${t.name} nghiêng ${t.p >= 0.5 ? 'Tài' : 'Xỉu'} (khớp ${Math.round(t.acc * 100)}%/${t.cnt} phiên gần nhất)`).join(', ');
+  }
   reason += `. Chọn ${how}.`;
+
+  modelStats = stats.map((s) => ({
+    Thuat_toan: s.name,
+    Phieu: s.p === null ? 'chưa đủ dữ liệu' : (s.p >= 0.5 ? 'Tài' : 'Xỉu'),
+    Ti_le_backtest: s.cnt ? Math.round(s.acc * 100) + '%' : 'n/a',
+    So_mau: s.cnt,
+    Trong_so: Number(s.w.toFixed(3)),
+  }));
+  predMeta = { afterN: last.n, side };
 
   return {
     Id: ID_NAME,
     Phien: last.phien,
     Ket_qua: nameOf(last.kq),
     Xuc_xac: last.dices.join('-'),
-    Du_doan: nameOf(predSide),
+    Du_doan: nameOf(side),
     Do_tin_cay: confidence + '%',
     Li_do: reason,
   };
@@ -309,6 +470,7 @@ const server = http.createServer((req, res) => {
   }
   return send(res, 404, { loi: 'Not found' });
 });
+
 
 loadFile();
 if (history.length) lastPrediction = buildPrediction();
