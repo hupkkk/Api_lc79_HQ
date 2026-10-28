@@ -1,8 +1,15 @@
 'use strict';
 /**
- * Server dự đoán Tài/Xỉu v2 — thuật toán thích nghi theo chế độ cầu.
- *   /dulieucau   : dữ liệu cầu (mỗi bảng 20 kết quả)
- *   /dudoanlc79  : dự đoán phiên mới
+ * Server dự đoán Tài/Xỉu v3 — thích nghi regime + chống bias Tài.
+ *   GET /dulieucau   : dữ liệu cầu (mỗi bảng 20 kết quả)
+ *   GET /dudoanlc79  : dự đoán phiên mới
+ *
+ * ENV tuỳ chỉnh:
+ *   PORT        (mặc định 3000)
+ *   API_URL     (mặc định endpoint tele68)
+ *   POLL_MS     (mặc định 5000)
+ *   BREAK_BIAS  (mặc định 0.10; 0 = tắt bẻ bệt, 0.18 = bẻ sớm, 0.02 = follow bệt)
+ *
  * Node >= 18 (fetch built-in, không cần thư viện ngoài).
  */
 const http = require('http');
@@ -15,8 +22,11 @@ const POLL_MS = Number(process.env.POLL_MS) || 5000;
 const TABLE_SIZE = 20;
 const MAX_HISTORY = 2000;
 const DATA_FILE = path.join(__dirname, 'data.json');
-const STATE_FILE = path.join(__dirname, 'tx_state.json'); // lưu hedge + phong độ
+const STATE_FILE = path.join(__dirname, 'tx_state.json');
 const ID_NAME = 'Ha Quoc';
+const BREAK_BIAS = Number.isFinite(Number(process.env.BREAK_BIAS))
+  ? Number(process.env.BREAK_BIAS)
+  : 0.10;
 
 /* ===================== LƯU TRỮ LỊCH SỬ ===================== */
 const store = new Map();
@@ -201,7 +211,7 @@ function buildCauData() {
   };
 }
 
-/* ===================== THUẬT TOÁN DỰ ĐOÁN v2 ===================== */
+/* ===================== THUẬT TOÁN DỰ ĐOÁN v3 ===================== */
 const MAX_USE = 600;
 const BT_WINDOW = 120;
 const BT_DECAY = 0.012;
@@ -210,6 +220,8 @@ const HEDGE_ETA_BOOST = 0.20;
 const FLIP_WINDOW = 30;
 const FLIP_MIN_SAMPLES = 20;
 const FLIP_THRESHOLD = 0.43;
+const W_MIN = 0.05;
+const W_MAX = 0.18;
 
 const live = { dung: 0, tong: 0 };
 const liveRecent = [];
@@ -255,7 +267,11 @@ function mRun(S, h, n) {
     if (!best || weight > best.weight) best = { k, ctx, cont, brk, tot, weight };
   }
   let pc = den > 0 ? (num + 0.15) / (den + 0.3) : 0.5;
-  if (L >= 4) pc -= Math.min(0.25, (L - 3) * 0.04);
+  // Hình phạt bệt: càng dài càng bẻ mạnh, tuỳ BREAK_BIAS
+  if (L >= 3 && BREAK_BIAS > 0) {
+    const breakPenalty = Math.min(0.35, (L - 2) * BREAK_BIAS);
+    pc -= breakPenalty;
+  }
   pc = clamp(pc, 0.2, 0.8);
   runMeta = { best, L, cur, runs };
   return cur.v === 'T' ? pc : 1 - pc;
@@ -327,6 +343,25 @@ function mFreq(S, h, n) {
   return clamp(0.5 - (t / 30 - 0.5) * 0.5, 0.35, 0.65);
 }
 
+// MỚI: model bẻ bệt độc lập — chỉ bỏ phiếu khi có bệt >= 3, không bị model khác dìm
+function mBreakBet(S, h, n) {
+  if (n < 30) return null;
+  const runs = runsOf(S.slice(0, n));
+  const cur = runs[runs.length - 1];
+  const L = cur.len;
+  if (L < 3) return null;
+  let reached = 0, started = 0;
+  for (const r of runs.slice(0, -1)) {
+    if (r.v !== cur.v) continue;
+    if (r.len >= 2) started++;
+    if (r.len >= L) reached++;
+  }
+  if (started < 4) return null;
+  const pCont = (reached + 1) / (started + 2);
+  const pBreak = 1 - pCont;
+  return cur.v === 'T' ? pBreak : 1 - pBreak;
+}
+
 const mKeyed = (keyFn, d, minTot) => (S, h, n) => {
   if (n < 20) return null;
   const key = (j) => { let s = ''; for (let i = j - d; i < j; i++) s += keyFn(h[i]) + ','; return s; };
@@ -340,6 +375,7 @@ const mKeyed = (keyFn, d, minTot) => (S, h, n) => {
 
 const MODELS = [
   ['Cầu theo/bẻ + điểm dừng bệt', mRun],
+  ['Bẻ bệt độc lập', mBreakBet],
   ['Markov bậc 2', mMarkov(2)],
   ['Markov bậc 3', mMarkov(3)],
   ['Markov bậc 4', mMarkov(4)],
@@ -355,7 +391,7 @@ const MODELS = [
 ];
 
 const recentPerModel = MODELS.map(() => []);
-const hedge = {}; // { regimeKey: [w0, w1, ...] }
+const hedge = {};
 let stateDirty = false;
 
 /* --- Regime: phân loại chế độ cầu hiện tại --- */
@@ -373,11 +409,17 @@ function regimeKey(S, n) {
   return 'normal';
 }
 
-/* --- Persist state (hedge + live + phong độ gần đây) --- */
+/* --- Persist state --- */
 function loadState() {
   try {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    if (s.hedge) Object.assign(hedge, s.hedge);
+    if (s.hedge && typeof s.hedge === 'object') {
+      // reset nếu số model thay đổi
+      for (const k of Object.keys(s.hedge)) {
+        const arr = s.hedge[k];
+        if (Array.isArray(arr) && arr.length === MODELS.length) hedge[k] = arr.slice();
+      }
+    }
     if (s.live) Object.assign(live, s.live);
     if (Array.isArray(s.liveRecent)) liveRecent.push(...s.liveRecent.slice(-40));
     if (Array.isArray(s.recentPerModel)) {
@@ -398,12 +440,14 @@ function saveState() {
   } catch (e) {}
 }
 
-/* --- Học online bất đối xứng, cập nhật hedge theo regime + phong độ model --- */
+/* --- Học online + phong độ model --- */
 function learn(nx) {
   if (!predMeta || !predMeta.votes) return;
   const isT = nx.kq === 'T';
   const regime = predMeta.regime || 'normal';
-  if (!hedge[regime]) hedge[regime] = MODELS.map(() => 1);
+  if (!hedge[regime] || hedge[regime].length !== MODELS.length) {
+    hedge[regime] = MODELS.map(() => 1);
+  }
   const w = hedge[regime];
   const eta = predMeta.boostEta ? HEDGE_ETA_BOOST : HEDGE_ETA;
 
@@ -430,6 +474,15 @@ const safe = (fn, S, h, n) => {
   try { const p = fn(S, h, n); return typeof p === 'number' && isFinite(p) ? p : null; } catch (e) { return null; }
 };
 
+/* --- Tie-breaker trung tính: KHÔNG mặc định Tài khi pT ~ 0.5 --- */
+function pickSide(pT, runs) {
+  if (pT > 0.52) return 'T';
+  if (pT < 0.48) return 'X';
+  const cur = runs[runs.length - 1];
+  if (cur.len >= 3) return cur.v === 'T' ? 'X' : 'T'; // bệt → bẻ
+  return cur.v; // momentum theo phiên cuối
+}
+
 function buildPrediction() {
   if (!history.length) return null;
   const h = history.slice(-MAX_USE);
@@ -438,10 +491,11 @@ function buildPrediction() {
   const last = h[n - 1];
   const start = Math.max(30, n - BT_WINDOW);
   const regime = regimeKey(S, n);
-  if (!hedge[regime]) hedge[regime] = MODELS.map(() => 1);
+  if (!hedge[regime] || hedge[regime].length !== MODELS.length) {
+    hedge[regime] = MODELS.map(() => 1);
+  }
   const wRegime = hedge[regime];
 
-  // Phát hiện đổi cầu: 15 phiên gần nhất dự đoán đúng < 42% => boost learning
   let boostEta = false;
   if (liveRecent.length >= 15) {
     const recentAcc = liveRecent.slice(-15).reduce((a, b) => a + b, 0) / 15;
@@ -462,7 +516,8 @@ function buildPrediction() {
       if ((p >= 0.5) === (S[i] === 'T')) hit += w;
     }
     const accShrunk = (hit + 10) / (wsum + 20);
-    const baseW = 0.03 + Math.max(0, accShrunk - 0.53) * 6;
+    // Sàn W_MIN, trần W_MAX → không model nào lấn át
+    const baseW = clamp(W_MIN + Math.max(0, accShrunk - 0.53) * 4, W_MIN, W_MAX);
     const hW = wRegime[mi] === undefined ? 1 : wRegime[mi];
     const w = baseW * hW;
 
@@ -473,7 +528,7 @@ function buildPrediction() {
       const hits = rec.reduce((a, b) => a + b, 0);
       const post = (hits + 2) / (rec.length + 4);
       if (post < FLIP_THRESHOLD) {
-        pNow = 1 - pNow; // model cùi => đi ngược lại
+        pNow = 1 - pNow;
         flipped = true;
       }
     }
@@ -485,17 +540,17 @@ function buildPrediction() {
   if (used.length) {
     let z = 0, ws = 0;
     for (const s of used) { z += s.w * logit(s.p); ws += s.w; }
-    pT = ws > 0 ? sigm(z / ws) : 0.5;
+    pT = ws > 0 ? sigm((z / ws) * 0.75) : 0.5; // dampen 0.75 chống overconfidence
   }
-  pT = clamp(pT, 0.38, 0.62);
+  pT = clamp(pT, 0.42, 0.58);
 
   const runs = runsOf(S);
   const cur = runs[runs.length - 1];
   const L = cur.len;
-  const side = pT >= 0.5 ? 'T' : 'X';
+  const side = pickSide(pT, runs);
   const follow = side === cur.v;
   const strength = Math.abs(pT - 0.5);
-  const how = (follow ? 'theo' : 'bẻ') + (strength > 0.08 ? ' mạnh' : ' nhẹ');
+  const how = (follow ? 'theo' : 'bẻ') + (strength > 0.06 ? ' mạnh' : ' nhẹ');
 
   let confidence = Math.round(Math.max(pT, 1 - pT) * 100);
   confidence = clamp(confidence, 51, 62);
@@ -510,15 +565,20 @@ function buildPrediction() {
     .sort((a, b) => Math.abs(b.w * logit(b.p)) - Math.abs(a.w * logit(a.p)))
     .slice(0, 3);
 
+  const tVotes = used.filter((s) => s.p >= 0.5).length;
+  const xVotes = used.filter((s) => s.p < 0.5).length;
+  const last50 = S.slice(-50);
+  const t50 = (last50.match(/T/g) || []).length;
+
   let reason = `[Regime: ${regime}] Cầu đang ${describeRuns(runs)}, ${L} phiên ${nameOf(cur.v)} liên tiếp`;
-  if (L >= 4) reason += `, bệt ${L} vào vùng điểm dừng`;
+  if (L >= 4) reason += `, bệt ${L} vào vùng điểm dừng (BREAK_BIAS=${BREAK_BIAS})`;
   if (runMeta && runMeta.best) {
     reason += `; cầu này trong lịch sử đi tiếp ${Math.round(runMeta.best.cont)} lần, dừng ${Math.round(runMeta.best.brk)} lần`;
   }
   if (top.length) {
     const flipCount = used.filter((s) => s.flipped).length;
-    reason += `; ${used.length} thuật toán bỏ phiếu`;
-    if (flipCount > 0) reason += ` (${flipCount} bị đảo do phong độ kém)`;
+    reason += `; ${used.length} model bỏ phiếu (T=${tVotes} X=${xVotes})`;
+    if (flipCount > 0) reason += `, ${flipCount} bị đảo do phong độ kém`;
     reason += `, nổi bật: ` + top
       .map((t) => `${t.name} → ${t.p >= 0.5 ? 'Tài' : 'Xỉu'} (${Math.round(t.acc * 100)}%/${Math.round(t.wsum)})`)
       .join(', ');
@@ -548,6 +608,8 @@ function buildPrediction() {
     Du_doan: nameOf(side),
     Do_tin_cay: confidence + '%',
     Regime: regime,
+    Phan_bo_phieu: `T=${tVotes} X=${xVotes} | 50 phiên gần: T=${t50}/50`,
+    Side_raw: pT.toFixed(3),
     Li_do: reason,
   };
 }
@@ -585,6 +647,7 @@ if (history.length) lastPrediction = buildPrediction();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log('Server chạy ở cổng ' + PORT);
+  console.log('BREAK_BIAS = ' + BREAK_BIAS);
   poll();
   setInterval(poll, POLL_MS);
 });
