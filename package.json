@@ -1,0 +1,13 @@
+{
+  "name": "tx-du-doan-server",
+  "version": "1.0.0",
+  "description": "Server du doan Tai/Xiu dua tren du lieu cau",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "ISC"
+}
