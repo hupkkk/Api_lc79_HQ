@@ -1,9 +1,9 @@
 'use strict';
 /**
- * Server dự đoán Tài/Xỉu - chỉ có 2 link GET:
+ * Server dự đoán Tài/Xỉu v2 — thuật toán thích nghi theo chế độ cầu.
  *   /dulieucau   : dữ liệu cầu (mỗi bảng 20 kết quả)
  *   /dudoanlc79  : dự đoán phiên mới
- * Yêu cầu Node >= 18 (dùng fetch có sẵn, không cần cài thư viện).
+ * Node >= 18 (fetch built-in, không cần thư viện ngoài).
  */
 const http = require('http');
 const fs = require('fs');
@@ -13,13 +13,14 @@ const PORT = process.env.PORT || 3000;
 const API_URL = process.env.API_URL || 'https://wtxmd52.tele68.com/v1/txmd5/sessions';
 const POLL_MS = Number(process.env.POLL_MS) || 5000;
 const TABLE_SIZE = 20;
-const MAX_HISTORY = 2000; // bội số của 20
+const MAX_HISTORY = 2000;
 const DATA_FILE = path.join(__dirname, 'data.json');
+const STATE_FILE = path.join(__dirname, 'tx_state.json'); // lưu hedge + phong độ
 const ID_NAME = 'Ha Quoc';
 
 /* ===================== LƯU TRỮ LỊCH SỬ ===================== */
-const store = new Map(); // phien -> record
-let history = [];        // mảng record đã sắp xếp tăng dần
+const store = new Map();
+let history = [];
 let dirty = false;
 let lastPrediction = null;
 let lastPhien = null;
@@ -33,20 +34,20 @@ function loadFile() {
       });
       rebuild();
     }
-  } catch (e) { /* chưa có file thì bỏ qua */ }
+  } catch (e) {}
 }
 
 function saveFile() {
   if (!dirty) return;
   dirty = false;
-  try { fs.writeFileSync(DATA_FILE, JSON.stringify(history)); } catch (e) { /* Render có thể không cho ghi, bỏ qua */ }
+  try { fs.writeFileSync(DATA_FILE, JSON.stringify(history)); } catch (e) {}
 }
 
 function rebuild() {
   history = Array.from(store.values()).sort((a, b) => a.n - b.n);
   if (history.length > MAX_HISTORY) {
     let cut = history.length - MAX_HISTORY;
-    cut = Math.ceil(cut / TABLE_SIZE) * TABLE_SIZE; // cắt theo bội số 20 để bảng không bị lệch
+    cut = Math.ceil(cut / TABLE_SIZE) * TABLE_SIZE;
     history.slice(0, cut).forEach((r) => store.delete(String(r.phien)));
     history = history.slice(cut);
   }
@@ -122,11 +123,7 @@ async function poll() {
     for (const r of items) {
       if (!store.has(r.phien)) { store.set(r.phien, r); added++; }
     }
-    if (added > 0) {
-      rebuild();
-      dirty = true;
-      saveFile();
-    }
+    if (added > 0) { rebuild(); dirty = true; saveFile(); }
     if (history.length) {
       const last = history[history.length - 1];
       if (last.phien !== lastPhien) {
@@ -204,14 +201,21 @@ function buildCauData() {
   };
 }
 
-/* ===================== THUẬT TOÁN DỰ ĐOÁN (NHIỀU MÔ HÌNH BỎ PHIẾU) ===================== */
-const MAX_USE = 600;   // chỉ dùng 600 phiên gần nhất để tính cho nhẹ
-const BT_WINDOW = 100; // số phiên gần nhất dùng để chấm điểm từng thuật toán
+/* ===================== THUẬT TOÁN DỰ ĐOÁN v2 ===================== */
+const MAX_USE = 600;
+const BT_WINDOW = 120;
+const BT_DECAY = 0.012;
+const HEDGE_ETA = 0.09;
+const HEDGE_ETA_BOOST = 0.20;
+const FLIP_WINDOW = 30;
+const FLIP_MIN_SAMPLES = 20;
+const FLIP_THRESHOLD = 0.43;
+
 const live = { dung: 0, tong: 0 };
+const liveRecent = [];
 let modelStats = [];
 let predMeta = null;
 let runMeta = null;
-let hedge = null; // trọng số tự học theo kết quả thật, mỗi thuật toán một số
 
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const logit = (p) => { p = clamp(p, 0.02, 0.98); return Math.log(p / (1 - p)); };
@@ -223,10 +227,7 @@ const smooth = (hit, tot, k) => {
 };
 const pointBucket = (p) => (p <= 7 ? 0 : p <= 10 ? 1 : p <= 13 ? 2 : p <= 16 ? 3 : 4);
 
-// Mỗi mô hình: (S, h, n) -> xác suất phiên thứ n ra Tài, chỉ dùng dữ liệu trước n. null = chưa đủ dữ liệu.
-// S là chuỗi 'T'/'X', h là mảng bản ghi (có .sum, .dices)
-
-// 1) Cầu theo/bẻ: thế cầu y hệt trong lịch sử đã đi tiếp hay đã dừng, có điểm dừng cho bệt
+/* --- Mô hình: (S, h, n) -> P(phiên n ra Tài) --- */
 function mRun(S, h, n) {
   const runs = runsOf(S.slice(0, n));
   const m = runs.length;
@@ -254,13 +255,12 @@ function mRun(S, h, n) {
     if (!best || weight > best.weight) best = { k, ctx, cont, brk, tot, weight };
   }
   let pc = den > 0 ? (num + 0.15) / (den + 0.3) : 0.5;
-  if (L >= 4) pc -= Math.min(0.25, (L - 3) * 0.04); // điểm dừng của bệt
+  if (L >= 4) pc -= Math.min(0.25, (L - 3) * 0.04);
   pc = clamp(pc, 0.2, 0.8);
   runMeta = { best, L, cur, runs };
   return cur.v === 'T' ? pc : 1 - pc;
 }
 
-// 2) Markov bậc k
 const mMarkov = (k) => (S, h, n) => {
   if (n < k + 15) return null;
   const cur = S.substr(n - k, k);
@@ -271,7 +271,6 @@ const mMarkov = (k) => (S, h, n) => {
   return tot < 3 ? null : smooth(hit, tot, 4);
 };
 
-// 3) N-gram đa bậc (2..8), bậc cao ưu tiên khi đủ mẫu
 function mNgram(S, h, n) {
   if (n < 30) return null;
   let p = 0.5, used = false;
@@ -291,7 +290,6 @@ function mNgram(S, h, n) {
   return used ? p : null;
 }
 
-// 4) Cầu đan xen 1-1: chuỗi đan xen dài a thì lịch sử cho thấy tiếp tục đan xen hay gãy
 function mZigzag(S, h, n) {
   if (n < 20) return null;
   let a = 1;
@@ -310,7 +308,6 @@ function mZigzag(S, h, n) {
   return S[n - 1] === 'T' ? 1 - pAlt : pAlt;
 }
 
-// 5) Cầu chu kỳ (lặp lại theo chu kỳ 2..6)
 function mPeriod(S, h, n) {
   for (let p = 2; p <= 6; p++) {
     if (n < p * 3 + 10) continue;
@@ -323,7 +320,6 @@ function mPeriod(S, h, n) {
   return null;
 }
 
-// 6) Cân bằng Tài/Xỉu trong 30 phiên gần nhất (hồi quy về trung bình, rất nhẹ)
 function mFreq(S, h, n) {
   if (n < 30) return null;
   let t = 0;
@@ -331,7 +327,6 @@ function mFreq(S, h, n) {
   return clamp(0.5 - (t / 30 - 0.5) * 0.5, 0.35, 0.65);
 }
 
-// 7) Các mô hình theo đặc trưng của điểm xúc xắc
 const mKeyed = (keyFn, d, minTot) => (S, h, n) => {
   if (n < 20) return null;
   const key = (j) => { let s = ''; for (let i = j - d; i < j; i++) s += keyFn(h[i]) + ','; return s; };
@@ -359,20 +354,81 @@ const MODELS = [
   ['Bộ ba / điểm cực đoan', mKeyed((r) => (r.dices[0] === r.dices[1] && r.dices[1] === r.dices[2] ? 'B' : r.sum <= 5 ? 'L' : r.sum >= 16 ? 'H' : 'N'), 1, 5)],
 ];
 
+const recentPerModel = MODELS.map(() => []);
+const hedge = {}; // { regimeKey: [w0, w1, ...] }
+let stateDirty = false;
+
+/* --- Regime: phân loại chế độ cầu hiện tại --- */
+function regimeKey(S, n) {
+  if (n < 10) return 'warmup';
+  const runs = runsOf(S.slice(0, n));
+  const L = runs[runs.length - 1].len;
+  let alt = 1;
+  for (let i = n - 2; i >= 0; i--) {
+    if (S[i] !== S[i + 1]) alt++; else break;
+  }
+  if (alt >= 4) return 'zigzag';
+  if (L >= 5) return 'bet_long';
+  if (L >= 3) return 'bet_mid';
+  return 'normal';
+}
+
+/* --- Persist state (hedge + live + phong độ gần đây) --- */
+function loadState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (s.hedge) Object.assign(hedge, s.hedge);
+    if (s.live) Object.assign(live, s.live);
+    if (Array.isArray(s.liveRecent)) liveRecent.push(...s.liveRecent.slice(-40));
+    if (Array.isArray(s.recentPerModel)) {
+      s.recentPerModel.forEach((rec, i) => {
+        if (recentPerModel[i] && Array.isArray(rec)) recentPerModel[i].push(...rec.slice(-FLIP_WINDOW));
+      });
+    }
+  } catch (e) {}
+}
+
+function saveState() {
+  if (!stateDirty) return;
+  stateDirty = false;
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({
+      hedge, live, liveRecent, recentPerModel,
+    }));
+  } catch (e) {}
+}
+
+/* --- Học online bất đối xứng, cập nhật hedge theo regime + phong độ model --- */
+function learn(nx) {
+  if (!predMeta || !predMeta.votes) return;
+  const isT = nx.kq === 'T';
+  const regime = predMeta.regime || 'normal';
+  if (!hedge[regime]) hedge[regime] = MODELS.map(() => 1);
+  const w = hedge[regime];
+  const eta = predMeta.boostEta ? HEDGE_ETA_BOOST : HEDGE_ETA;
+
+  predMeta.votes.forEach((p, i) => {
+    if (p === null || Math.abs(p - 0.5) < 0.005) return;
+    if (w[i] === undefined) w[i] = 1;
+    const correct = (p >= 0.5) === isT;
+    w[i] = clamp(w[i] * Math.exp(correct ? eta : -eta), 0.25, 3.0);
+    const rec = recentPerModel[i];
+    if (rec) {
+      rec.push(correct ? 1 : 0);
+      if (rec.length > FLIP_WINDOW) rec.shift();
+    }
+  });
+
+  liveRecent.push(predMeta.side === nx.kq ? 1 : 0);
+  if (liveRecent.length > 40) liveRecent.shift();
+
+  stateDirty = true;
+  saveState();
+}
+
 const safe = (fn, S, h, n) => {
   try { const p = fn(S, h, n); return typeof p === 'number' && isFinite(p) ? p : null; } catch (e) { return null; }
 };
-
-// Tự học: sau mỗi phiên có kết quả thật, thuật toán nào bỏ phiếu sai thì giảm trọng số, đúng thì tăng nhẹ
-function learn(nx) {
-  if (!predMeta || !predMeta.votes || !hedge) return;
-  const isT = nx.kq === 'T';
-  predMeta.votes.forEach((p, i) => {
-    if (p === null || Math.abs(p - 0.5) < 0.005 || hedge[i] === undefined) return;
-    const wrong = (p >= 0.5) !== isT;
-    hedge[i] = clamp(hedge[i] * Math.exp(wrong ? -0.1 : 0.1), 0.3, 2.5);
-  });
-}
 
 function buildPrediction() {
   if (!history.length) return null;
@@ -381,32 +437,55 @@ function buildPrediction() {
   const S = h.map((r) => r.kq).join('');
   const last = h[n - 1];
   const start = Math.max(30, n - BT_WINDOW);
+  const regime = regimeKey(S, n);
+  if (!hedge[regime]) hedge[regime] = MODELS.map(() => 1);
+  const wRegime = hedge[regime];
 
-  // chấm điểm từng thuật toán bằng backtest, rồi lấy phiếu hiện tại
+  // Phát hiện đổi cầu: 15 phiên gần nhất dự đoán đúng < 42% => boost learning
+  let boostEta = false;
+  if (liveRecent.length >= 15) {
+    const recentAcc = liveRecent.slice(-15).reduce((a, b) => a + b, 0) / 15;
+    if (recentAcc < 0.42) boostEta = true;
+  }
+
   const stats = [];
   runMeta = null;
-  if (!hedge || hedge.length !== MODELS.length) hedge = MODELS.map(() => 1);
   for (let mi = 0; mi < MODELS.length; mi++) {
     const [name, fn] = MODELS[mi];
-    let ok = 0, cnt = 0;
+    let hit = 0, wsum = 0;
     for (let i = start; i < n; i++) {
       const p = safe(fn, S, h, i);
       if (p === null || Math.abs(p - 0.5) < 0.005) continue;
-      cnt++;
-      if ((p >= 0.5) === (S[i] === 'T')) ok++;
+      const age = n - i;
+      const w = Math.exp(-BT_DECAY * age);
+      wsum += w;
+      if ((p >= 0.5) === (S[i] === 'T')) hit += w;
     }
-    const acc = cnt ? ok / cnt : 0.5;
-    const shrunk = (ok + 25) / (cnt + 50); // kéo về 50% khi ít mẫu để tránh may mắn ngẫu nhiên
-    const w = (0.03 + Math.max(0, shrunk - 0.53) * 6) * hedge[mi];
-    stats.push({ name, acc, cnt, w, p: safe(fn, S, h, n) });
-  }
-  const used = stats.filter((s) => s.p !== null);
+    const accShrunk = (hit + 10) / (wsum + 20);
+    const baseW = 0.03 + Math.max(0, accShrunk - 0.53) * 6;
+    const hW = wRegime[mi] === undefined ? 1 : wRegime[mi];
+    const w = baseW * hW;
 
+    let pNow = safe(fn, S, h, n);
+    let flipped = false;
+    const rec = recentPerModel[mi];
+    if (pNow !== null && rec && rec.length >= FLIP_MIN_SAMPLES) {
+      const hits = rec.reduce((a, b) => a + b, 0);
+      const post = (hits + 2) / (rec.length + 4);
+      if (post < FLIP_THRESHOLD) {
+        pNow = 1 - pNow; // model cùi => đi ngược lại
+        flipped = true;
+      }
+    }
+    stats.push({ name, acc: accShrunk, wsum, w, p: pNow, flipped });
+  }
+
+  const used = stats.filter((s) => s.p !== null && s.w > 0);
   let pT = 0.5;
   if (used.length) {
     let z = 0, ws = 0;
     for (const s of used) { z += s.w * logit(s.p); ws += s.w; }
-    pT = sigm(z / ws);
+    pT = ws > 0 ? sigm(z / ws) : 0.5;
   }
   pT = clamp(pT, 0.38, 0.62);
 
@@ -419,34 +498,47 @@ function buildPrediction() {
   const how = (follow ? 'theo' : 'bẻ') + (strength > 0.08 ? ' mạnh' : ' nhẹ');
 
   let confidence = Math.round(Math.max(pT, 1 - pT) * 100);
-  confidence = clamp(confidence, 51, 62); // xúc xắc là ngẫu nhiên nên không để độ tin cậy ảo cao
+  confidence = clamp(confidence, 51, 62);
   if (n < TABLE_SIZE) confidence = Math.min(confidence, 55);
+  if (liveRecent.length >= 20) {
+    const recentAcc = liveRecent.slice(-20).reduce((a, b) => a + b, 0) / 20;
+    if (recentAcc < 0.45) confidence = Math.max(51, confidence - 3);
+  }
 
   const top = used
     .slice()
     .sort((a, b) => Math.abs(b.w * logit(b.p)) - Math.abs(a.w * logit(a.p)))
     .slice(0, 3);
 
-  let reason = `Dựa vào /dulieucau: cầu đang chạy dạng ${describeRuns(runs)}, hiện ${L} phiên ${nameOf(cur.v)} liên tiếp`;
-  if (L >= 4) reason += `, bệt ${L} đã vào vùng cân nhắc điểm dừng`;
+  let reason = `[Regime: ${regime}] Cầu đang ${describeRuns(runs)}, ${L} phiên ${nameOf(cur.v)} liên tiếp`;
+  if (L >= 4) reason += `, bệt ${L} vào vùng điểm dừng`;
   if (runMeta && runMeta.best) {
-    reason += `; cầu này trong lịch sử đã đi tiếp ${Math.round(runMeta.best.cont)} lần, dừng ${Math.round(runMeta.best.brk)} lần`;
+    reason += `; cầu này trong lịch sử đi tiếp ${Math.round(runMeta.best.cont)} lần, dừng ${Math.round(runMeta.best.brk)} lần`;
   }
   if (top.length) {
-    reason += `; ${used.length} thuật toán bỏ phiếu, nổi bật: ` +
-      top.map((t) => `${t.name} nghiêng ${t.p >= 0.5 ? 'Tài' : 'Xỉu'} (khớp ${Math.round(t.acc * 100)}%/${t.cnt} phiên gần nhất)`).join(', ');
+    const flipCount = used.filter((s) => s.flipped).length;
+    reason += `; ${used.length} thuật toán bỏ phiếu`;
+    if (flipCount > 0) reason += ` (${flipCount} bị đảo do phong độ kém)`;
+    reason += `, nổi bật: ` + top
+      .map((t) => `${t.name} → ${t.p >= 0.5 ? 'Tài' : 'Xỉu'} (${Math.round(t.acc * 100)}%/${Math.round(t.wsum)})`)
+      .join(', ');
   }
+  if (boostEta) reason += '. Phát hiện đổi cầu → tăng tốc học';
   reason += `. Chọn ${how}.`;
 
   modelStats = stats.map((s, i) => ({
     Thuat_toan: s.name,
     Phieu: s.p === null ? 'chưa đủ dữ liệu' : (s.p >= 0.5 ? 'Tài' : 'Xỉu'),
-    Ti_le_backtest: s.cnt ? Math.round(s.acc * 100) + '%' : 'n/a',
-    So_mau: s.cnt,
+    Da_dao: s.flipped ? 'có' : '',
+    Ti_le_backtest: s.wsum > 0 ? Math.round(s.acc * 100) + '%' : 'n/a',
+    Mau_hieu_dung: Math.round(s.wsum),
     Trong_so: Number(s.w.toFixed(3)),
-    He_so_tu_hoc: Number(hedge[i].toFixed(2)),
+    Hedge_regime: Number((wRegime[i] === undefined ? 1 : wRegime[i]).toFixed(2)),
+    Phong_do_gan: recentPerModel[i] && recentPerModel[i].length
+      ? Math.round((recentPerModel[i].reduce((a, b) => a + b, 0) / recentPerModel[i].length) * 100) + '%'
+      : 'n/a',
   }));
-  predMeta = { afterN: last.n, side, votes: stats.map((s) => s.p) };
+  predMeta = { afterN: last.n, side, votes: stats.map((s) => s.p), regime, boostEta };
 
   return {
     Id: ID_NAME,
@@ -455,6 +547,7 @@ function buildPrediction() {
     Xuc_xac: last.dices.join('-'),
     Du_doan: nameOf(side),
     Do_tin_cay: confidence + '%',
+    Regime: regime,
     Li_do: reason,
   };
 }
@@ -487,6 +580,7 @@ const server = http.createServer((req, res) => {
 });
 
 loadFile();
+loadState();
 if (history.length) lastPrediction = buildPrediction();
 
 server.listen(PORT, '0.0.0.0', () => {
